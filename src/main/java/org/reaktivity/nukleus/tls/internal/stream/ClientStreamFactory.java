@@ -15,10 +15,17 @@
  */
 package org.reaktivity.nukleus.tls.internal.stream;
 
+import static java.lang.String.format;
 import static java.nio.ByteBuffer.allocateDirect;
 import static java.util.Arrays.asList;
 import static java.util.Objects.requireNonNull;
+import static org.agrona.BitUtil.isPowerOfTwo;
 import static org.agrona.LangUtil.rethrowUnchecked;
+import static org.reaktivity.nukleus.tls.internal.FrameFlags.EMPTY;
+import static org.reaktivity.nukleus.tls.internal.FrameFlags.RST;
+import static org.reaktivity.nukleus.tls.internal.FrameFlags.isFin;
+import static org.reaktivity.nukleus.tls.internal.FrameFlags.isReset;
+import static org.reaktivity.nukleus.tls.internal.TlsConfiguration.TRANSFER_CAPACITY;
 
 import java.nio.ByteBuffer;
 import java.util.Objects;
@@ -38,8 +45,11 @@ import javax.net.ssl.SSLParameters;
 
 import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
+import org.agrona.collections.IntArrayList;
 import org.agrona.collections.Long2ObjectHashMap;
+import org.agrona.collections.LongArrayList;
 import org.agrona.concurrent.UnsafeBuffer;
+import org.reaktivity.nukleus.buffer.DirectBufferBuilder;
 import org.reaktivity.nukleus.buffer.MemoryManager;
 import org.reaktivity.nukleus.function.MessageConsumer;
 import org.reaktivity.nukleus.function.MessagePredicate;
@@ -50,6 +60,7 @@ import org.reaktivity.nukleus.tls.internal.TlsConfiguration;
 import org.reaktivity.nukleus.tls.internal.types.Flyweight;
 import org.reaktivity.nukleus.tls.internal.types.ListFW;
 import org.reaktivity.nukleus.tls.internal.types.OctetsFW;
+import org.reaktivity.nukleus.tls.internal.types.ListFW.Builder;
 import org.reaktivity.nukleus.tls.internal.types.control.RouteFW;
 import org.reaktivity.nukleus.tls.internal.types.control.TlsRouteExFW;
 import org.reaktivity.nukleus.tls.internal.types.stream.AckFW;
@@ -58,22 +69,38 @@ import org.reaktivity.nukleus.tls.internal.types.stream.RegionFW;
 import org.reaktivity.nukleus.tls.internal.types.stream.TlsBeginExFW;
 import org.reaktivity.nukleus.tls.internal.types.stream.TransferFW;
 import org.reaktivity.nukleus.tls.internal.util.function.ObjectLongBiFunction;
+import org.reaktivity.reaktor.internal.buffer.DefaultDirectBufferBuilder;
 
 public final class ClientStreamFactory implements StreamFactory
 {
+    private static final ListFW<RegionFW> EMPTY_REGION_RO;
     private static final ByteBuffer EMPTY_BYTE_BUFFER = ByteBuffer.allocate(0);
     private static final int MAXIMUM_PAYLOAD_LENGTH = (1 << Short.SIZE) - 1;
+    private static final Consumer<SSLEngineResult> HANDSHAKE_NOOP = (r) -> {};
+
+    static
+    {
+        ListFW.Builder<RegionFW.Builder, RegionFW> regionsRW = new Builder<RegionFW.Builder, RegionFW>(
+                new RegionFW.Builder(),
+                new RegionFW());
+        EMPTY_REGION_RO = regionsRW.wrap(new UnsafeBuffer(new byte[100]), 0, 100).build();
+    }
 
     private final RouteFW routeRO = new RouteFW();
     private final TlsRouteExFW tlsRouteExRO = new TlsRouteExFW();
 
     private final BeginFW beginRO = new BeginFW();
-    private final TransferFW dataRO = new TransferFW();
+    private final TransferFW transferRO = new TransferFW();
     private final AckFW ackRO = new AckFW();
+    private final ListFW<RegionFW> regionsRO = new ListFW<RegionFW>(new RegionFW());
+    private final DirectBufferBuilder directBufferBuilderRO = new DefaultDirectBufferBuilder();
 
     private final BeginFW.Builder beginRW = new BeginFW.Builder();
     private final TransferFW.Builder transferRW = new TransferFW.Builder();
     private final AckFW.Builder ackRW = new AckFW.Builder();
+
+    private final DirectBuffer view = new UnsafeBuffer(new byte[0]);
+    private final MutableDirectBuffer directBufferRW = new UnsafeBuffer(new byte[0]);
 
     private final TlsBeginExFW tlsBeginExRO = new TlsBeginExFW();
     private final TlsBeginExFW.Builder tlsBeginExRW = new TlsBeginExFW.Builder();
@@ -83,15 +110,17 @@ public final class ClientStreamFactory implements StreamFactory
     private final SSLContext context;
     private final RouteManager router;
     private final MutableDirectBuffer writeBuffer;
-    private final MemoryManager memoryManager;
     private final LongSupplier supplyStreamId;
     private final LongSupplier supplyCorrelationId;
+    private final MemoryManager memoryManager;
 
     private final Long2ObjectHashMap<ClientHandshake> correlations;
     private final ByteBuffer inAppByteBuffer;
     private final ByteBuffer outAppByteBuffer;
     private final ByteBuffer outNetByteBuffer;
-    private final DirectBuffer outNetBuffer;
+    private final ByteBuffer inNetByteBuffer;
+
+    public final int transferCapacity;
 
     private final Function<RouteFW, LongSupplier> supplyWriteFrameCounter;
     private final Function<RouteFW, LongSupplier> supplyReadFrameCounter;
@@ -120,10 +149,16 @@ public final class ClientStreamFactory implements StreamFactory
         this.supplyCorrelationId = requireNonNull(supplyCorrelationId);
         this.correlations = requireNonNull(correlations);
 
-        this.inAppByteBuffer = allocateDirect(writeBuffer.capacity());
-        this.outAppByteBuffer = allocateDirect(writeBuffer.capacity());
-        this.outNetByteBuffer = allocateDirect(Math.min(writeBuffer.capacity(), MAXIMUM_PAYLOAD_LENGTH));
-        this.outNetBuffer = new UnsafeBuffer(outNetByteBuffer);
+        this.transferCapacity = config.transferCapacity();
+        if (!isPowerOfTwo(transferCapacity))
+        {
+            throw new IllegalArgumentException(format("%s is not a power of 2", TRANSFER_CAPACITY));
+        }
+
+        this.inAppByteBuffer = allocateDirect(transferCapacity);
+        this.outAppByteBuffer = allocateDirect(transferCapacity);
+        this.outNetByteBuffer = allocateDirect(transferCapacity);
+        this.inNetByteBuffer = allocateDirect(transferCapacity);
 
         this.supplyWriteFrameCounter = supplyWriteFrameCounter;
         this.supplyReadFrameCounter = supplyReadFrameCounter;
@@ -291,6 +326,7 @@ public final class ClientStreamFactory implements StreamFactory
         private MessageConsumer streamState;
 
         private long networkId;
+        private EncryptMemoryManager networkMemoryManager;
 
         private ClientAcceptStream(
             String tlsHostname,
@@ -357,16 +393,8 @@ public final class ClientStreamFactory implements StreamFactory
             switch (msgTypeId)
             {
             case TransferFW.TYPE_ID:
-                final TransferFW data = dataRO.wrap(buffer, index, index + length);
-                handleData(data.regions());
-                if (FrameFlags.isReset(data.flags()))
-                {
-                    handleAbort();
-                }
-                else if (FrameFlags.isFin(data.flags()))
-                {
-                    handleEnd();
-                }
+                final TransferFW transfer = transferRO.wrap(buffer, index, index + length);
+                handleTransfer(transfer);
                 break;
             default:
 //                doReset();  TODO
@@ -404,6 +432,16 @@ public final class ClientStreamFactory implements StreamFactory
 
                 tlsEngine.setSSLParameters(tlsParameters);
 
+                this.networkMemoryManager = new EncryptMemoryManager(
+                    memoryManager,
+                    directBufferBuilderRO,
+                    directBufferRW,
+                    regionsRO,
+                    transferCapacity,
+                    networkId,
+                    () -> 1,
+                    i -> {});
+
                 final ClientHandshake newHandshake = new ClientHandshake(
                     tlsEngine,
                     tlsApplicationProtocol,
@@ -439,57 +477,120 @@ public final class ClientStreamFactory implements StreamFactory
             }
         }
 
-        private void handleData(
-            ListFW<RegionFW> regions)
+        private void handleTransfer(
+            TransferFW transfer)
         {
+            final ListFW<RegionFW> regions = transfer.regions();
+            final int flags = transfer.flags();
+//            regions.forEach(r -> readBytesAccumulator.accept(r.length()));
+//            if (!regions.isEmpty())
+//            {
+//                readFrameCounter.getAsLong();
+//            }
+
+            processApplication(
+                regions,
+                transfer.authorization(),
+                flags);
+
+            if (isReset(flags))
+            {
+                handleApplicationReset();
+            }
+            else if(isFin(flags))
+            {
+                handleApplicationFin();
+            }
+        }
+
+        private void processApplication(
+            final ListFW<RegionFW> regions,
+            final long authorization,
+            final int flags)
+        {
+            // stage into buffer
+            inAppByteBuffer.clear();
+
+            regions.forEach(r ->
+            {
+                final long rAddress = memoryManager.resolve(r.address());
+                final int length = r.length();
+                view.wrap(rAddress, length);
+                final int appByteBufferIndex = inAppByteBuffer.position();
+                view.getBytes(0, inAppByteBuffer, appByteBufferIndex, length);
+                inAppByteBuffer.position(appByteBufferIndex + length);
+            });
+            inAppByteBuffer.flip();
+
             try
             {
-                // Note: inAppBuffer is emptied by SslEngine.wrap(...)
-                //       so should be able to eliminate allocation+copy (stateless)
-                inAppByteBuffer.clear();
-                // DPW TODO
-//                payload.buffer().getBytes(payload.offset(), inAppByteBuffer, payload.sizeof());
-                inAppByteBuffer.flip();
-
                 while (inAppByteBuffer.hasRemaining() && !tlsEngine.isOutboundDone())
                 {
-                    outNetByteBuffer.rewind();
-                    SSLEngineResult result = tlsEngine.wrap(inAppByteBuffer, outNetByteBuffer);
+                    outNetByteBuffer.clear();
+                    final int maxPayloadSize = networkMemoryManager.maxPayloadSize(regions);
+                    //    outNetByteBuffer.limit(maxPayloadSize);  TODO, need to check for buffer OVERFLOW,
+                    // instead we are checking bytesProduced < maxPayload Size (if we do TODO need bookkeeping)
 
-// DPW TODO
-//                    flushNetwork(tlsEngine, result.bytesProduced(), networkTarget, networkId,
-//                            authorization, this::handleNetworkReplyDone);
+                    SSLEngineResult result = tlsEngine.wrap(inAppByteBuffer, outNetByteBuffer);
+                    final int bytesProduced = result.bytesProduced();
+
+                    if (maxPayloadSize < bytesProduced)
+                    {
+                        throw new IllegalArgumentException("transfer capacity exceeded");
+                        // TODO: reset stream instead
+                    }
+                    outNetByteBuffer.flip();
+
+                    if (inAppByteBuffer.hasRemaining())
+                    {
+                        doTransfer(
+                            networkTarget,
+                            networkId,
+                            authorization,
+                            EMPTY,
+                            rb -> networkMemoryManager.packRegions(outNetByteBuffer, 0, bytesProduced, EMPTY_REGION_RO, rb));
+                    }
+                    else
+                    {
+                        doTransfer(
+                            networkTarget,
+                            networkId,
+                            authorization,
+                            EMPTY,
+                            rb -> networkMemoryManager.packRegions(outNetByteBuffer, 0, bytesProduced, regions, rb));
+                    }
                 }
             }
             catch (SSLException ex)
             {
-//                doReset();
-//                doAbort();
+                // TODO testing
+                doTransfer(networkTarget, networkId, authorization, RST);
             }
         }
 
-        private void handleEnd()
+        private void handleApplicationFin()
         {
 
-//            try
-//            {
+            try
+            {
 //                doCloseOutbound(
 //                        tlsEngine,
 //                        networkTarget,
 //                        networkId,
 //                        authorization,
 //                        this::handleNetworkReplyDone);
-//            }
-//            catch (SSLException ex)
-//            {
-//                doAbort(networkTarget, networkId, authorization);
-//            }
+                throw new SSLException("Not implemented yet");
+            }
+            catch (SSLException ex)
+            {
+                doTransfer(networkTarget, networkId, authorization, RST);
+            }
         }
 
-        private void handleAbort()
+        private void handleApplicationReset()
         {
             tlsEngine.closeOutbound();
-//            doAbort();
+            doTransfer(networkTarget, networkId, authorization, RST);
         }
 
         private void handleThrottle(
@@ -500,51 +601,31 @@ public final class ClientStreamFactory implements StreamFactory
         {
             switch (msgTypeId)
             {
-            case AckFW.TYPE_ID:
-                final AckFW ack = ackRO.wrap(buffer, index, index + length);
-                final int flags = ack.flags();
-                if (FrameFlags.isFin(flags))
-                {
-                    // DPW TODO
-                }
-                else if(FrameFlags.isReset(flags))
-                {
-                    handleReset(ack);
-                }
-                else
-                {
-                    handleWindow(ack);
-                }
-                break;
-            default:
-                // ignore
-                break;
+                case AckFW.TYPE_ID:
+                    final AckFW ack = ackRO.wrap(buffer, index, index + length);
+                    final ListFW<RegionFW> regions = ack.regions();
+                    final int flags = ack.flags();
+                    if (isReset(flags))
+                    {
+                        tlsEngine.closeOutbound();
+                        doAck(applicationThrottle, applicationId, RST);
+                    }
+                    else if (!regions.isEmpty() || isFin(flags))
+                    {
+                        doAck(
+                            applicationThrottle,
+                            applicationId,
+                            flags,
+                            rsb -> regions.forEach(r -> rsb.item(rb -> rb.address(r.address())
+                                                                         .length(r.length())
+                                                                         .streamId(r.streamId()))));
+                    }
+                    break;
+                default:
+                    // ignore
+                    break;
             }
         }
-
-        private void sendApplicationWindow()
-        {
-            // TODO DPW
-//            doWindow(applicationThrottle, applicationId);
-        }
-
-        private void handleWindow(AckFW ack)
-        {
-            sendApplicationWindow();
-        }
-
-        private void handleReset(
-            AckFW reset)
-        {
-//            doReset();
-            tlsEngine.closeOutbound();
-        }
-
-        private void handleNetworkReplyDone()
-        {
-//            doReset();
-        }
-
     }
 
     public final class ClientHandshake
@@ -1184,18 +1265,6 @@ public final class ClientStreamFactory implements StreamFactory
         }
     }
 
-    private void alignSlotBuffer(
-        final MutableDirectBuffer slotBuffer,
-        final int bytesConsumed,
-        final int bytesRemaining)
-    {
-        if (bytesConsumed > 0)
-        {
-            writeBuffer.putBytes(0, slotBuffer, bytesConsumed, bytesRemaining);
-            slotBuffer.putBytes(0, writeBuffer, 0, bytesRemaining);
-        }
-    }
-
     private void doTlsBegin(
         MessageConsumer target,
         long targetId,
@@ -1227,6 +1296,23 @@ public final class ClientStreamFactory implements StreamFactory
                         .sizeof();
     }
 
+
+//    private void doCloseOutbound(
+//        SSLEngine tlsEngine,
+//        MessageConsumer networkTarget,
+//        long networkId,
+//        long authorization,
+//        Runnable networkReplyDoneHandler,
+//        LongSupplier writeFrameCounter,
+//        LongConsumer writeBytesAccumulator) throws SSLException
+//    {
+//        tlsEngine.closeOutbound();
+//        outNetByteBuffer.rewind();
+//        SSLEngineResult result = tlsEngine.wrap(inAppByteBuffer, outNetByteBuffer);
+//        flushNetwork(tlsEngine, result.bytesProduced(), networkTarget, networkId, authorization,
+//                networkReplyDoneHandler);
+//    }
+
     private void doBegin(
         final MessageConsumer target,
         final long targetId,
@@ -1245,59 +1331,86 @@ public final class ClientStreamFactory implements StreamFactory
         target.accept(begin.typeId(), begin.buffer(), begin.offset(), begin.sizeof());
     }
 
-    private void doData(
+    private void doTransfer(
         final MessageConsumer target,
         final long targetId,
         final long authorization,
-        final OctetsFW payload)
+        final int flags,
+        final Consumer<Builder<RegionFW.Builder, RegionFW>> mutator)
     {
-        // DPW TODO
-//        final WriteFW TODO
-//        target.accept(data.typeId(), data.buffer(), data.offset(), data.sizeof());
+        final TransferFW transfer = transferRW.wrap(writeBuffer, 0, writeBuffer.capacity())
+            .streamId(targetId)
+            .authorization(authorization)
+            .flags(flags)
+            .regions(mutator)
+            .build();
+        target.accept(transfer.typeId(), transfer.buffer(), transfer.offset(), transfer.sizeof());
     }
 
-    private void doEnd(
+    private void doTransfer(
         final MessageConsumer target,
         final long targetId,
-        final long authorization)
+        final long authorization,
+        final int flags)
     {
-        // DPW TODO
+        final TransferFW transfer = transferRW.wrap(writeBuffer, 0, writeBuffer.capacity())
+            .streamId(targetId)
+            .authorization(authorization)
+            .flags(flags)
+            .build();
+        target.accept(transfer.typeId(), transfer.buffer(), transfer.offset(), transfer.sizeof());
     }
 
-    private void doAbort(
-        final MessageConsumer target,
-        final long targetId,
-        final long authorization)
-    {
-        // DPW TODO
-    }
 
-    private void doReset(
-        final MessageConsumer throttle,
-        final long throttleId)
+    private void doAck(
+            final MessageConsumer throttle,
+            final long throttleId,
+            final int flags,
+            Consumer<Builder<RegionFW.Builder, RegionFW>> mutator)
     {
-        // DPW TODO
         final AckFW ack = ackRW.wrap(writeBuffer, 0, writeBuffer.capacity())
-               .streamId(throttleId)
-               .build();
-
+                               .streamId(throttleId)
+                               .flags(flags)
+                               .regions(mutator)
+                               .build();
         throttle.accept(ack.typeId(), ack.buffer(), ack.offset(), ack.sizeof());
     }
 
-    private void doCloseOutbound(
-        SSLEngine tlsEngine,
-        MessageConsumer networkTarget,
-        long networkId,
-        long authorization,
-        Runnable networkReplyDoneHandler,
-        LongSupplier writeFrameCounter,
-        LongConsumer writeBytesAccumulator) throws SSLException
+    private void doAck(
+        final MessageConsumer throttle,
+        final long throttleId,
+        final int flags)
     {
-        tlsEngine.closeOutbound();
-        outNetByteBuffer.rewind();
-        SSLEngineResult result = tlsEngine.wrap(inAppByteBuffer, outNetByteBuffer);
-        flushNetwork(tlsEngine, result.bytesProduced(), networkTarget, networkId, authorization,
-                networkReplyDoneHandler);
+        final AckFW ack = ackRW.wrap(writeBuffer, 0, writeBuffer.capacity())
+                .streamId(throttleId)
+                .flags(flags)
+                .build();
+        throttle.accept(ack.typeId(), ack.buffer(), ack.offset(), ack.sizeof());
+    }
+
+
+    private void doCloseInbound(
+        final SSLEngine tlsEngine) throws SSLException
+    {
+        tlsEngine.closeInbound();
+    }
+
+    private ByteBuffer stageInAppBuffer(
+        LongArrayList regionAddresses,
+        IntArrayList regionLengths)
+    {
+        // TODO better loop
+        for (int i = 0; i < regionAddresses.size(); i++)
+        {
+            int position = inAppByteBuffer.position();
+            long addr = regionAddresses.get(i);
+            int length = regionLengths.get(i);
+            view.wrap(memoryManager.resolve(addr), length);
+            view.getBytes(0, inAppByteBuffer, position, length);
+            inAppByteBuffer.position(position + length);
+        }
+        inAppByteBuffer.flip();
+        return inAppByteBuffer;
     }
 
 }
