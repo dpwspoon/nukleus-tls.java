@@ -560,7 +560,7 @@ public final class ServerStreamFactory implements StreamFactory
                     {
                         handleFlushAppData(bytesProduced, totalBytesConsumed - bytesConsumerIter, flags);
                     }
-                    bytesConsumerIter = totalBytesConsumed;
+                    bytesConsumerIter += totalBytesConsumed;
                 }
             }
             catch (SSLException ex)
